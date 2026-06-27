@@ -1,0 +1,350 @@
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  PROFESSIONAL ALGORITHMIC TRADING SYSTEM v2.0                   ║
+// ║  Author  : Meghraj Nikalje                                       ║
+// ║  Platform: TradingView — PineScript v5                           ║
+// ║  Strategy: Multi-Timeframe EMA + RSI + MACD + Volume + ATR      ║
+// ║            with Dynamic Position Sizing & Regime Detection       ║
+// ╚══════════════════════════════════════════════════════════════════╝
+//@version=5
+
+strategy(
+    title             = "Pro Algo System — MTF + Dynamic Risk",
+    shorttitle        = "ProAlgo v2",
+    overlay           = true,
+    pyramiding        = 0,
+    default_qty_type  = strategy.cash,
+    default_qty_value = 1000,
+    initial_capital   = 100000,
+    currency          = currency.USD,
+    commission_type   = strategy.commission.percent,
+    commission_value  = 0.05,
+    slippage          = 2,
+    calc_on_every_tick= false,
+    process_orders_on_close = true
+)
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 1 ─ USER INPUTS (grouped & validated)
+// ══════════════════════════════════════════════════════════════════
+
+// ── EMA Settings ──────────────────────────────────────────────────
+g1 = "📈 EMA Settings"
+ema_fast  = input.int(9,   "Fast EMA",        minval=2,  maxval=50,  group=g1)
+ema_slow  = input.int(21,  "Slow EMA",        minval=5,  maxval=100, group=g1)
+ema_trend = input.int(50,  "Trend EMA",       minval=20, maxval=200, group=g1)
+ema_htf   = input.int(200, "HTF Trend EMA",   minval=50, maxval=500, group=g1)
+
+// ── Oscillators ───────────────────────────────────────────────────
+g2 = "🔄 Oscillator Settings"
+rsi_len   = input.int(14, "RSI Length",       minval=2,  group=g2)
+rsi_ob    = input.int(65, "RSI Overbought",   minval=55, maxval=90,  group=g2)
+rsi_os    = input.int(35, "RSI Oversold",     minval=10, maxval=45,  group=g2)
+macd_fast = input.int(12, "MACD Fast",        minval=2,  group=g2)
+macd_slow = input.int(26, "MACD Slow",        minval=5,  group=g2)
+macd_sig  = input.int(9,  "MACD Signal",      minval=2,  group=g2)
+stoch_k   = input.int(14, "Stochastic K",     minval=2,  group=g2)
+stoch_d   = input.int(3,  "Stochastic D",     minval=1,  group=g2)
+
+// ── Volume & Volatility ───────────────────────────────────────────
+g3 = "📊 Volume & Volatility"
+vol_ma_len     = input.int(20,  "Volume MA Length",    minval=5,   group=g3)
+atr_len        = input.int(14,  "ATR Length",          minval=2,   group=g3)
+atr_mult_sl    = input.float(2.0,"ATR SL Multiplier",  minval=0.5, step=0.25, group=g3)
+atr_mult_tp    = input.float(3.5,"ATR TP Multiplier",  minval=1.0, step=0.25, group=g3)
+atr_trail_mult = input.float(1.5,"ATR Trail Multiplier",minval=0.5, step=0.25, group=g3)
+require_vol_confirm = input.bool(true, "Require Volume Spike", group=g3)
+
+// ── Risk Management ───────────────────────────────────────────────
+g4 = "🛡️ Risk Management"
+risk_pct        = input.float(1.0, "Risk % per Trade",   minval=0.1, maxval=5.0, step=0.1, group=g4)
+max_drawdown_pct= input.float(15.0,"Max Drawdown % (Circuit Breaker)", minval=5.0, group=g4)
+max_daily_trades= input.int(3,     "Max Trades per Day", minval=1, maxval=10, group=g4)
+use_trailing    = input.bool(true,  "Use Trailing Stop",  group=g4)
+
+// ── Session & Filter ──────────────────────────────────────────────
+g5 = "🕐 Session & Filters"
+trade_long  = input.bool(true,  "Enable Long Trades",  group=g5)
+trade_short = input.bool(true,  "Enable Short Trades", group=g5)
+use_session = input.bool(false, "Filter by Session",   group=g5)
+session_str = input.session("0915-1530", "Allowed Session", group=g5)
+
+// ── Backtesting Window ────────────────────────────────────────────
+g6 = "📅 Backtest Window"
+start_date = input.time(timestamp("01 Jan 2023 00:00"), "Start Date", group=g6)
+end_date   = input.time(timestamp("31 Dec 2024 00:00"), "End Date",   group=g6)
+in_window  = time >= start_date and time <= end_date
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 2 ─ INDICATOR CALCULATIONS
+// ══════════════════════════════════════════════════════════════════
+
+// EMAs
+ema9   = ta.ema(close, ema_fast)
+ema21  = ta.ema(close, ema_slow)
+ema50  = ta.ema(close, ema_trend)
+ema200 = ta.ema(close, ema_htf)
+
+// RSI + Smoothed RSI
+rsi     = ta.rsi(close, rsi_len)
+rsi_sma = ta.sma(rsi, 3)
+
+// MACD
+[macd_line, macd_signal, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+macd_cross_up   = ta.crossover(macd_line, macd_signal)
+macd_cross_down = ta.crossunder(macd_line, macd_signal)
+
+// Stochastic
+stoch_k_val = ta.sma(ta.stoch(close, high, low, stoch_k), stoch_d)
+stoch_d_val = ta.sma(stoch_k_val, stoch_d)
+
+// ATR (volatility-adjusted stops)
+atr = ta.atr(atr_len)
+
+// Volume analysis
+vol_ma     = ta.sma(volume, vol_ma_len)
+vol_spike  = volume > vol_ma * 1.5
+vol_filter = require_vol_confirm ? vol_spike : true
+
+// Bollinger Bands (squeeze detection)
+[bb_up, bb_mid, bb_lo] = ta.bb(close, 20, 2.0)
+bb_width      = (bb_up - bb_lo) / bb_mid
+bb_squeeze    = bb_width < ta.percentile_linear_interpolation(bb_width, 125, 20)
+
+// ADX (trend strength filter)
+[adx_plus, adx_minus, adx] = ta.dmi(14, 14)
+strong_trend = adx > 20
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 3 ─ MARKET REGIME DETECTION
+// ══════════════════════════════════════════════════════════════════
+
+// Regime: Bull / Bear / Ranging
+bull_regime   = close > ema200 and ema50 > ema200 and adx > 18
+bear_regime   = close < ema200 and ema50 < ema200 and adx > 18
+range_regime  = adx <= 18 or bb_squeeze
+
+// Volatility regime (high vol = widen stops)
+vol_regime_high = atr > ta.sma(atr, 20) * 1.3
+atr_adjusted    = vol_regime_high ? atr * 1.2 : atr
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 4 ─ DYNAMIC POSITION SIZING
+// ══════════════════════════════════════════════════════════════════
+
+// ATR-based position sizing: risk ₹X per trade, stop = ATR × multiplier
+capital         = strategy.equity
+risk_amount     = capital * (risk_pct / 100)
+stop_dist       = atr_adjusted * atr_mult_sl
+qty_shares      = math.floor(risk_amount / stop_dist)
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 5 ─ ENTRY & EXIT CONDITIONS
+// ══════════════════════════════════════════════════════════════════
+
+// Daily trade counter reset
+var int trades_today = 0
+var int last_day     = 0
+if dayofweek != last_day
+    trades_today := 0
+    last_day     := dayofweek
+
+// Circuit breaker
+drawdown_pct = (strategy.equity - strategy.initial_capital) / strategy.initial_capital * 100
+circuit_ok   = drawdown_pct > -max_drawdown_pct
+
+// Session filter
+session_ok = use_session ? not na(time(timeframe.period, session_str)) : true
+
+// ── LONG CONDITIONS ───────────────────────────────────────────────
+long_trend     = ema9 > ema21 and ema21 > ema50 and close > ema50
+long_htf       = close > ema200
+long_momentum  = ta.crossover(ema9, ema21) or (ema9 > ema21 and macd_cross_up)
+long_rsi       = rsi > 40 and rsi < rsi_ob and rsi > rsi_sma
+long_macd      = macd_line > macd_signal and macd_hist > 0
+long_stoch     = stoch_k_val > stoch_d_val and stoch_k_val < 80
+long_vol_ok    = vol_filter
+long_regime_ok = bull_regime or (not range_regime and long_trend)
+
+long_signal = (
+    long_momentum  and
+    long_trend     and
+    long_htf       and
+    long_rsi       and
+    long_macd      and
+    long_stoch     and
+    long_vol_ok    and
+    long_regime_ok and
+    circuit_ok     and
+    session_ok     and
+    trades_today   < max_daily_trades and
+    in_window      and
+    trade_long
+)
+
+// ── SHORT CONDITIONS ──────────────────────────────────────────────
+short_trend    = ema9 < ema21 and ema21 < ema50 and close < ema50
+short_htf      = close < ema200
+short_momentum = ta.crossunder(ema9, ema21) or (ema9 < ema21 and macd_cross_down)
+short_rsi      = rsi < 60 and rsi > rsi_os and rsi < rsi_sma
+short_macd     = macd_line < macd_signal and macd_hist < 0
+short_stoch    = stoch_k_val < stoch_d_val and stoch_k_val > 20
+short_regime_ok= bear_regime or (not range_regime and short_trend)
+
+short_signal = (
+    short_momentum  and
+    short_trend     and
+    short_htf       and
+    short_rsi       and
+    short_macd      and
+    short_stoch     and
+    long_vol_ok     and
+    short_regime_ok and
+    circuit_ok      and
+    session_ok      and
+    trades_today    < max_daily_trades and
+    in_window       and
+    trade_short
+)
+
+// ── STOP LOSS / TAKE PROFIT LEVELS ───────────────────────────────
+long_sl = close - atr_adjusted * atr_mult_sl
+long_tp = close + atr_adjusted * atr_mult_tp
+long_tr = close - atr_adjusted * atr_trail_mult
+
+short_sl = close + atr_adjusted * atr_mult_sl
+short_tp = close - atr_adjusted * atr_mult_tp
+short_tr = close + atr_adjusted * atr_trail_mult
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 6 ─ ORDER EXECUTION
+// ══════════════════════════════════════════════════════════════════
+
+if long_signal and strategy.position_size == 0
+    strategy.entry("Long", strategy.long, qty=qty_shares, comment="L")
+    strategy.exit("Long Exit", "Long",
+        stop        = long_sl,
+        limit       = long_tp,
+        trail_price = use_trailing ? long_tr : na,
+        trail_offset= use_trailing ? atr_adjusted * atr_trail_mult * 0.5 : na,
+        comment     = "L-Exit"
+    )
+    trades_today += 1
+
+if short_signal and strategy.position_size == 0
+    strategy.entry("Short", strategy.short, qty=qty_shares, comment="S")
+    strategy.exit("Short Exit", "Short",
+        stop        = short_sl,
+        limit       = short_tp,
+        trail_price = use_trailing ? short_tr : na,
+        trail_offset= use_trailing ? atr_adjusted * atr_trail_mult * 0.5 : na,
+        comment     = "S-Exit"
+    )
+    trades_today += 1
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 7 ─ VISUALISATION
+// ══════════════════════════════════════════════════════════════════
+
+// EMA plots
+plot(ema9,   "EMA 9",   color=color.new(color.blue,   0), linewidth=1)
+plot(ema21,  "EMA 21",  color=color.new(color.orange, 0), linewidth=2)
+plot(ema50,  "EMA 50",  color=color.new(color.purple, 0), linewidth=2)
+plot(ema200, "EMA 200", color=color.new(color.red,    0), linewidth=1, style=plot.style_circles)
+
+// Bollinger Bands
+bb_up_plot = plot(bb_up, "BB Upper", color=color.new(color.gray, 70), linewidth=1)
+bb_lo_plot = plot(bb_lo, "BB Lower", color=color.new(color.gray, 70), linewidth=1)
+fill(bb_up_plot, bb_lo_plot, color=color.new(color.gray, 92))
+
+// Entry/exit signals
+plotshape(long_signal,  "BUY",  location=location.belowbar, color=color.new(color.lime,  0), style=shape.triangleup,   size=size.normal, text="BUY")
+plotshape(short_signal, "SELL", location=location.abovebar, color=color.new(color.red,   0), style=shape.triangledown, size=size.normal, text="SELL")
+
+// Stop/TP levels (only when in position)
+plot(strategy.position_size > 0 ? long_sl : na, "Long SL", color=color.red,   style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size > 0 ? long_tp : na, "Long TP", color=color.green, style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size < 0 ? short_sl : na,"Short SL",color=color.red,   style=plot.style_linebr, linewidth=1)
+plot(strategy.position_size < 0 ? short_tp : na,"Short TP",color=color.green, style=plot.style_linebr, linewidth=1)
+
+// Regime background
+bgcolor(bull_regime  ? color.new(color.green, 97) :
+        bear_regime  ? color.new(color.red,   97) :
+        range_regime ? color.new(color.gray,  96) : na, title="Market Regime")
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 8 ─ PERFORMANCE DASHBOARD TABLE
+// ══════════════════════════════════════════════════════════════════
+var table dash = table.new(position.top_right, 3, 12, border_width=1, border_color=color.gray)
+
+// Color helpers
+c_hdr  = color.new(color.navy,   0)
+c_bg   = color.new(color.white,  0)
+c_pos  = color.new(color.green,  0)
+c_neg  = color.new(color.red,    0)
+c_neu  = color.new(color.gray,   0)
+c_txt  = color.new(color.white,  0)
+c_blk  = color.new(color.black,  0)
+
+win_rate    = strategy.wintrades   / math.max(strategy.closedtrades, 1) * 100
+avg_win     = strategy.grossprofit / math.max(strategy.wintrades, 1)
+avg_loss    = strategy.grossloss   / math.max(strategy.losstrades, 1)
+profit_factor = strategy.grossprofit / math.max(math.abs(strategy.grossloss), 1)
+rr_ratio    = math.abs(avg_win / math.min(avg_loss, -0.01))
+
+if barstate.islast
+    // Header row
+    table.cell(dash, 0, 0,  "METRIC",         text_color=c_txt, bgcolor=c_hdr, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 0,  "VALUE",          text_color=c_txt, bgcolor=c_hdr, text_size=size.small)
+    table.cell(dash, 2, 0,  "STATUS",         text_color=c_txt, bgcolor=c_hdr, text_size=size.small)
+
+    // Metrics
+    table.cell(dash, 0, 1,  "Net P&L",        text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 1,  str.tostring(strategy.netprofit, "0.##"), text_color=strategy.netprofit >= 0 ? c_pos : c_neg, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 1,  strategy.netprofit >= 0 ? "✅" : "❌", text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 2,  "Win Rate",       text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 2,  str.tostring(win_rate, "0.#") + "%",   text_color=win_rate >= 50 ? c_pos : c_neg,  bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 2,  win_rate >= 55 ? "✅" : win_rate >= 45 ? "⚠️" : "❌", text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 3,  "Profit Factor",  text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 3,  str.tostring(profit_factor, "0.##"),   text_color=profit_factor >= 1.5 ? c_pos : c_neg, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 3,  profit_factor >= 1.5 ? "✅" : "⚠️",   text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 4,  "R:R Ratio",      text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 4,  str.tostring(rr_ratio, "0.##") + ":1",text_color=rr_ratio >= 1.5 ? c_pos : c_neg, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 4,  rr_ratio >= 2.0 ? "✅" : rr_ratio >= 1.5 ? "⚠️" : "❌", text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 5,  "Max Drawdown",   text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 5,  str.tostring(strategy.max_drawdown, "0.##"),        text_color=c_neg, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 5,  strategy.max_drawdown_percent < 10 ? "✅" : "⚠️",  text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 6,  "Total Trades",   text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 6,  str.tostring(strategy.closedtrades),                text_color=c_neu, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 6,  "📊",            text_color=c_blk, bgcolor=c_bg,  text_size=size.small)
+
+    table.cell(dash, 0, 7,  "Open Trades",    text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 7,  str.tostring(strategy.opentrades),                  text_color=c_neu, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 7,  "🔓",            text_color=c_blk, bgcolor=c_bg,  text_size=size.small)
+
+    table.cell(dash, 0, 8,  "Current RSI",    text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 8,  str.tostring(rsi, "0.#"),           text_color=rsi > rsi_ob ? c_neg : rsi < rsi_os ? c_pos : c_blk, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 8,  rsi > rsi_ob ? "OB" : rsi < rsi_os ? "OS" : "OK", text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 9,  "ATR",            text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 9,  str.tostring(atr, "0.####"),        text_color=c_neu, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 9,  vol_regime_high ? "⚡HIGH" : "NORM", text_color=vol_regime_high ? c_neg : c_neu, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 10, "Regime",         text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 10, bull_regime ? "BULL" : bear_regime ? "BEAR" : "RANGE", text_color=bull_regime ? c_pos : bear_regime ? c_neg : c_neu, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 10, bull_regime ? "✅" : bear_regime ? "🐻" : "⚠️",    text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+    table.cell(dash, 0, 11, "Circuit Breaker",text_color=c_blk, bgcolor=c_bg,  text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 11, circuit_ok ? "ACTIVE" : "TRIPPED",  text_color=circuit_ok ? c_pos : c_neg, bgcolor=c_bg, text_size=size.small)
+    table.cell(dash, 2, 11, circuit_ok ? "🟢" : "🔴",           text_color=c_blk, bgcolor=c_bg, text_size=size.small)
+
+// ══════════════════════════════════════════════════════════════════
+// SECTION 9 ─ ALERT CONDITIONS
+// ══════════════════════════════════════════════════════════════════
+alertcondition(long_signal,  "LONG ENTRY",  "ProAlgo: BUY Signal — {{ticker}} @ {{close}}")
+alertcondition(short_signal, "SHORT ENTRY", "ProAlgo: SELL Signal — {{ticker}} @ {{close}}")
+alertcondition(not circuit_ok, "CIRCUIT BREAKER", "ProAlgo: MAX DRAWDOWN REACHED — trading halted")
